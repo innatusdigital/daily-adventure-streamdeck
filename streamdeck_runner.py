@@ -708,6 +708,10 @@ def on_button_press(deck, key_index: int, state: bool):
     _gesture_dispatch(deck, key_index, state)
 
 def handle_gesture(deck, key_index: int, gesture: str):
+    # Python requires `global` declarations before any read of the name in the
+    # function. Several branches below mutate these — declare upfront.
+    global ACTIVE_DEVICE_NAME, ACTIVE_DEVICE_ID, PAGE_IDX, CHAPTER_PAGE_IDX
+
     slot = key_index + 1
     log.info("Slot %d: %s", slot, gesture)
 
@@ -736,7 +740,6 @@ def handle_gesture(deck, key_index: int, gesture: str):
             r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
                               json={"slot": SETTINGS_SLOT, "deviceId": device_id}, timeout=15)
             if r.ok:
-                global ACTIVE_DEVICE_NAME, ACTIVE_DEVICE_ID
                 with _state_lock:
                     ACTIVE_DEVICE_NAME = device_name
                     ACTIVE_DEVICE_ID   = device_id
@@ -787,7 +790,6 @@ def handle_gesture(deck, key_index: int, gesture: str):
         total_pages = max(1, (total + CHAPTERS_PER_PAGE - 1) // CHAPTERS_PER_PAGE)
         # Next/cycle chapter page
         if slot == CHAPTER_NEXT_SLOT and total_pages > 1:
-            global CHAPTER_PAGE_IDX
             with _config_lock:
                 CHAPTER_PAGE_IDX = (CHAPTER_PAGE_IDX + 1) % total_pages
                 new_idx = CHAPTER_PAGE_IDX
@@ -834,7 +836,6 @@ def handle_gesture(deck, key_index: int, gesture: str):
     if slot == PAGE_SWITCHER_SLOT and _is_multipage():
         if gesture != "single":
             return
-        global PAGE_IDX
         with _config_lock:
             PAGE_IDX = (PAGE_IDX + 1) % len(PAGES)
             _apply_current_page()
