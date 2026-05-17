@@ -97,6 +97,7 @@ SLEEP_STATE  = SLEEP_AWAKE
 WAKE_UNTIL   = 0.0   # epoch time: ignore schedule until this timestamp
 DIM_TIME     = ""    # "HH:MM" or ""
 OFF_TIME     = ""    # "HH:MM" or ""
+MANUAL_SLEEP = False # True when user pressed Sleep in settings — scheduler stays out of the way
 _sleep_lock  = threading.Lock()
 
 PLAYPAUSE_ICON: Image.Image | None = None
@@ -342,6 +343,9 @@ def render_settings(deck):
         elif slot == 2:
             img = _tile(deck, (20, 120, 60), "2", (100, 220, 140))
             _txt(ImageDraw.Draw(img), "Refresh", w, h // 2 - 4, (180, 255, 200))
+        elif slot == 3:
+            img  = _tile(deck, (45, 45, 75), "3", (170, 170, 220))
+            _txt(ImageDraw.Draw(img), "Sleep", w, h // 2 - 4, (220, 220, 255))
         elif slot == SETTINGS_SLOT:
             img = _tile(deck, (100, 30, 30), "15", (220, 100, 100))
             _txt(ImageDraw.Draw(img), "Back", w, h // 2 - 4, (255, 160, 160))
@@ -410,12 +414,23 @@ def enter_off(deck):
     log.info("Night mode: off")
 
 def wake_up(deck):
-    global SLEEP_STATE, WAKE_UNTIL
+    global SLEEP_STATE, WAKE_UNTIL, MANUAL_SLEEP
     with _sleep_lock:
-        SLEEP_STATE = SLEEP_AWAKE
-        WAKE_UNTIL  = time.time() + WAKE_COOLDOWN
+        SLEEP_STATE  = SLEEP_AWAKE
+        WAKE_UNTIL   = time.time() + WAKE_COOLDOWN
+        MANUAL_SLEEP = False
     deck.set_brightness(NORMAL_BRIGHTNESS)
     log.info("Woke up (stays awake for %ds)", WAKE_COOLDOWN)
+
+def manual_sleep(deck):
+    """User-triggered sleep from the settings menu. Any key press wakes it back up
+    without triggering. Scheduler stays out of the way until cleared."""
+    global SLEEP_STATE, MANUAL_SLEEP
+    with _sleep_lock:
+        SLEEP_STATE  = SLEEP_OFF
+        MANUAL_SLEEP = True
+    deck.set_brightness(0)
+    log.info("Manual sleep — press any button to wake")
 
 def sleep_scheduler(deck):
     """Background thread: enforce dim/off schedule."""
@@ -423,10 +438,15 @@ def sleep_scheduler(deck):
     while True:
         time.sleep(30)
         with _sleep_lock:
-            state     = SLEEP_STATE
-            wake_end  = WAKE_UNTIL
-            dim_t     = DIM_TIME
-            off_t     = OFF_TIME
+            state        = SLEEP_STATE
+            wake_end     = WAKE_UNTIL
+            dim_t        = DIM_TIME
+            off_t        = OFF_TIME
+            manual_sleep = MANUAL_SLEEP
+
+        # Manual sleep takes precedence — only a key press clears it
+        if manual_sleep:
+            continue
 
         if not dim_t and not off_t:
             continue  # night mode disabled
@@ -541,6 +561,10 @@ def on_button_press(deck, key_index: int, state: bool):
             COVER_CACHE.clear()
             _apply_schedule(data)
             go_normal(deck)
+        elif slot == 3:
+            # Manual sleep — exit settings first so wake_up returns to normal mode
+            go_normal(deck)
+            manual_sleep(deck)
         elif slot == SETTINGS_SLOT:
             go_normal(deck)
         return
