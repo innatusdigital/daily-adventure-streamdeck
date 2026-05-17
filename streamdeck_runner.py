@@ -76,9 +76,13 @@ SLEEP_OFF   = "off"
 
 # -- State --------------------------------------------------------------------
 
-BUTTON_CONFIG: dict[int, dict] = {}
+BUTTON_CONFIG: dict[int, dict] = {}   # Buttons for the currently-displayed page
+PAGES:         list[dict] = []         # All pages from server: [{"id", "buttons"}, ...]
+PAGE_IDX:      int        = 0          # Currently displayed page index
 COVER_CACHE:   dict[str, Image.Image] = {}
 _config_lock = threading.Lock()
+
+PAGE_SWITCHER_SLOT = 13   # Slot 13 becomes the page-switcher when len(PAGES) > 1
 
 CURRENT_MODE       = MODE_NORMAL
 DEVICE_LIST:       list[dict] = []
@@ -160,6 +164,41 @@ def _tile(deck, bg: tuple, label: str = "", label_color=(200, 200, 200)) -> Imag
         ImageDraw.Draw(img).text((3, 3), label, fill=label_color)
     return img
 
+# -- Multi-page helpers -------------------------------------------------------
+
+def _is_multipage() -> bool:
+    """True when the server returned 2+ pages — slot 13 becomes the page-switcher."""
+    with _config_lock:
+        return len(PAGES) > 1
+
+def _apply_current_page():
+    """Copy PAGES[PAGE_IDX].buttons into BUTTON_CONFIG. Caller must hold _config_lock or
+    accept that another writer may interleave (we only use this from already-locked paths)."""
+    if not PAGES:
+        BUTTON_CONFIG.clear()
+        return
+    idx = max(0, min(PAGE_IDX, len(PAGES) - 1))
+    raw = PAGES[idx].get("buttons", {}) or {}
+    BUTTON_CONFIG.clear()
+    BUTTON_CONFIG.update({int(k): v for k, v in raw.items()})
+
+def _apply_config_payload(data: dict):
+    """Single entry point for server config → local state. Handles both new (`pages`)
+    and legacy (`buttons`) shapes. Resets PAGE_IDX if it goes out of range after a
+    page is removed."""
+    global PAGES, PAGE_IDX
+    raw_pages = data.get("pages")
+    with _config_lock:
+        if isinstance(raw_pages, list) and raw_pages:
+            PAGES = raw_pages
+        else:
+            # Legacy single-page fallback
+            buttons = data.get("buttons", {}) or {}
+            PAGES = [{"id": "legacy", "buttons": buttons}]
+        if PAGE_IDX >= len(PAGES):
+            PAGE_IDX = 0
+        _apply_current_page()
+
 # -- Tile renderers -----------------------------------------------------------
 
 def make_card_image(deck, slot: int, assignment: dict | None) -> Image.Image:
@@ -218,6 +257,23 @@ def make_playpause_image(deck) -> Image.Image:
     ImageDraw.Draw(img).text((3, 3), "14", fill=(170, 130, 210))
     return img
 
+def make_page_switcher_image(deck, page_idx: int, page_count: int) -> Image.Image:
+    """Sky-blue tile shown on slot 13 when multi-page is active. Pressing cycles pages."""
+    kf = deck.key_image_format()
+    w, h = kf["size"]
+    img  = Image.new("RGB", (w, h), (15, 95, 165))
+    draw = ImageDraw.Draw(img)
+    draw.text((3, 3), "13", fill=(120, 200, 255))
+    # Big arrow ring (rough refresh glyph)
+    cx, cy = w // 2, h // 2 - 4
+    r = max(8, w // 5)
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(220, 240, 255), width=2)
+    # Arrowhead at top-right of ring
+    ax, ay = cx + r - 1, cy - r + 1
+    draw.polygon([(ax, ay - 4), (ax + 6, ay + 2), (ax, ay + 6)], fill=(220, 240, 255))
+    _txt(draw, f"Page {page_idx + 1}/{page_count}", w, h - 14, (200, 230, 255))
+    return img
+
 def make_settings_image(deck) -> Image.Image:
     kf = deck.key_image_format()
     w, h = kf["size"]
@@ -257,10 +313,16 @@ def make_device_tile_image(deck, device: dict, is_active: bool) -> Image.Image:
 # -- Render modes -------------------------------------------------------------
 
 def render_normal(deck):
+    with _config_lock:
+        multipage  = len(PAGES) > 1
+        page_idx   = PAGE_IDX
+        page_count = len(PAGES)
     for i in range(deck.key_count()):
         slot = i + 1
         if   slot == PLAYPAUSE_SLOT: img = make_playpause_image(deck)
         elif slot == SETTINGS_SLOT:  img = make_settings_image(deck)
+        elif slot == PAGE_SWITCHER_SLOT and multipage:
+            img = make_page_switcher_image(deck, page_idx, page_count)
         else:
             with _config_lock:
                 a = BUTTON_CONFIG.get(slot)
@@ -475,10 +537,7 @@ def on_button_press(deck, key_index: int, state: bool):
         elif slot == 2:
             log.info("Refreshing...")
             data = fetch_config()
-            new_buttons = {int(k): v for k, v in data.get("buttons", {}).items()}
-            with _config_lock:
-                BUTTON_CONFIG.clear()
-                BUTTON_CONFIG.update(new_buttons)
+            _apply_config_payload(data)
             COVER_CACHE.clear()
             _apply_schedule(data)
             go_normal(deck)
@@ -493,6 +552,18 @@ def on_button_press(deck, key_index: int, state: bool):
 
     if slot == PLAYPAUSE_SLOT:
         _trigger_playpause(deck, key_index)
+        return
+
+    # Page-switcher (multi-page only). Cycles locally, no server call.
+    if slot == PAGE_SWITCHER_SLOT and _is_multipage():
+        global PAGE_IDX
+        with _config_lock:
+            PAGE_IDX = (PAGE_IDX + 1) % len(PAGES)
+            _apply_current_page()
+            new_idx = PAGE_IDX
+        COVER_CACHE.clear()
+        log.info("Switched to page %d", new_idx + 1)
+        render_normal(deck)
         return
 
     with _config_lock:
@@ -515,10 +586,13 @@ def on_button_press(deck, key_index: int, state: bool):
     log.info("Slot %d pressed -> %s", slot, assignment.get("title", "?"))
     deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_pressed_image(deck, slot)))
 
+    with _config_lock:
+        current_page_idx = PAGE_IDX
+
     feedback = False
     try:
         r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
-                          json={"slot": slot}, timeout=15)
+                          json={"slot": slot, "pageIdx": current_page_idx}, timeout=15)
         if r.ok:
             data = r.json()
             if data.get("alreadyPlaying"):
@@ -560,10 +634,7 @@ def poll_config(deck):
     while True:
         time.sleep(CONFIG_POLL_INTERVAL)
         data = fetch_config()
-        new_buttons = {int(k): v for k, v in data.get("buttons", {}).items()}
-        with _config_lock:
-            BUTTON_CONFIG.clear()
-            BUTTON_CONFIG.update(new_buttons)
+        _apply_config_payload(data)
         COVER_CACHE.clear()
         _apply_schedule(data)
         with _state_lock: m = CURRENT_MODE
@@ -591,9 +662,7 @@ def main():
     log.info("Connected: %s (%d keys)", deck.deck_type(), deck.key_count())
 
     data = fetch_config()
-    buttons = {int(k): v for k, v in data.get("buttons", {}).items()}
-    with _config_lock:
-        BUTTON_CONFIG.update(buttons)
+    _apply_config_payload(data)
     _apply_schedule(data)
 
     devices, active_id = fetch_devices()
