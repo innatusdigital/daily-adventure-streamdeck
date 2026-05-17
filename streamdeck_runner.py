@@ -801,15 +801,23 @@ def handle_gesture(deck, key_index: int, gesture: str):
         if ch_idx >= total:
             return
         ch = chapters[ch_idx]
-        chapter_key = ch.get("key")
+        # Server returns each item as {title, chapterKey, trackKey} — covers both
+        # multi-chapter cards and single-chapter multi-track audiobooks.
+        chapter_key = ch.get("chapterKey") or ch.get("key")
+        track_key   = ch.get("trackKey") or "01"
         if not chapter_key:
             return
-        log.info("Chapter pick: %s ch %s (%s)", card_title, chapter_key, ch.get("title", "?"))
+        log.info("Chapter pick: %s ch=%s tr=%s (%s)", card_title, chapter_key, track_key, ch.get("title", "?"))
         deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_pressed_image(deck, slot)))
         ok = False
         try:
             r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
-                              json={"slot": source_slot, "pageIdx": source_page_ix, "chapterKey": chapter_key}, timeout=15)
+                              json={
+                                  "slot": source_slot,
+                                  "pageIdx": source_page_ix,
+                                  "chapterKey": chapter_key,
+                                  "trackKey": track_key,
+                              }, timeout=15)
             ok = r.ok
             if not r.ok:
                 log.warning("Chapter trigger failed: %s %s", r.status_code, r.text[:120])
