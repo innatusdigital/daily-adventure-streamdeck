@@ -67,6 +67,11 @@ ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
 MODE_NORMAL        = "normal"
 MODE_SETTINGS      = "settings"
 MODE_DEVICE_SELECT = "device_select"
+MODE_CHAPTERS      = "chapters"
+
+CHAPTERS_PER_PAGE       = 12  # slots 1-12; slot 13=next/cycle, 14=playpause, 15=back
+CHAPTER_NEXT_SLOT       = 13
+CHAPTER_BACK_SLOT       = SETTINGS_SLOT  # slot 15 re-used as Back
 
 # -- Sleep states -------------------------------------------------------------
 
@@ -83,6 +88,14 @@ COVER_CACHE:   dict[str, Image.Image] = {}
 _config_lock = threading.Lock()
 
 PAGE_SWITCHER_SLOT = 13   # Slot 13 becomes the page-switcher when len(PAGES) > 1
+
+# Chapter-browse state — only valid while CURRENT_MODE == MODE_CHAPTERS
+CHAPTERS:                 list[dict] = []  # [{key, title}, ...] for the long-pressed card
+CHAPTER_PAGE_IDX:         int        = 0
+CHAPTER_CARD_ID:          str        = ""
+CHAPTER_CARD_TITLE:       str        = ""
+CHAPTER_SOURCE_SLOT:      int        = 0   # the deck slot whose card we're browsing
+CHAPTER_SOURCE_PAGE_IDX:  int        = 0   # the deck page that slot was on
 
 CURRENT_MODE       = MODE_NORMAL
 DEVICE_LIST:       list[dict] = []
@@ -137,6 +150,17 @@ def fetch_devices() -> tuple[list[dict], str]:
     except Exception as exc:
         log.warning("Failed to fetch devices: %s", exc)
         return [], ""
+
+def fetch_chapters(card_id: str) -> list[dict]:
+    """Returns [{key, title}, ...] for a card, or [] on error."""
+    try:
+        r = requests.get(f"{API_URL}/api/yoto/streamdeck/chapters",
+                         params={"cardId": card_id}, headers=_headers(), timeout=10)
+        r.raise_for_status()
+        return r.json().get("chapters", [])
+    except Exception as exc:
+        log.warning("Failed to fetch chapters for %s: %s", card_id, exc)
+        return []
 
 # -- Image helpers ------------------------------------------------------------
 
@@ -311,6 +335,35 @@ def make_device_tile_image(deck, device: dict, is_active: bool) -> Image.Image:
         draw.rectangle([(0, 0), (w - 1, h - 1)], outline=(100, 200, 255), width=2)
     return img
 
+def make_chapter_tile_image(deck, chapter: dict, chapter_number: int) -> Image.Image:
+    """Tile shown for a chapter in chapter-browse mode. Big chapter number,
+    truncated title underneath."""
+    kf = deck.key_image_format()
+    w, h = kf["size"]
+    img  = Image.new("RGB", (w, h), (35, 50, 70))
+    draw = ImageDraw.Draw(img)
+    # Chapter number large in upper third
+    num_str = str(chapter_number)
+    nx = (w - len(num_str) * 12) // 2
+    draw.text((nx, 4), num_str, fill=(255, 220, 140))
+    # Title in lower portion (up to two lines)
+    title = chapter.get("title", "?")
+    words = title.split()
+    l1 = ""
+    l2 = ""
+    for word in words:
+        candidate = (l1 + " " + word).strip() if l1 else word
+        if len(candidate) <= 9:
+            l1 = candidate
+        else:
+            candidate2 = (l2 + " " + word).strip() if l2 else word
+            l2 = candidate2[:9]
+    y = h - 24
+    _txt(draw, l1, w, y, (220, 230, 255))
+    if l2:
+        _txt(draw, l2, w, y + 10, (180, 195, 230))
+    return img
+
 # -- Render modes -------------------------------------------------------------
 
 def render_normal(deck):
@@ -370,6 +423,41 @@ def render_device_select(deck):
                   if idx < len(devices) else Image.new("RGB", (w, h), (15, 15, 15))
         deck.set_key_image(i, PILHelper.to_native_format(deck, img))
 
+def render_chapters(deck):
+    """Slots 1-12: chapter tiles for the current chapter-page. Slot 13: next/cycle
+    page (only when more than one chapter-page). Slot 14: play/pause preserved.
+    Slot 15: Back to the normal card grid."""
+    kf = deck.key_image_format()
+    w, h = kf["size"]
+    with _config_lock:
+        chapters    = list(CHAPTERS)
+        page_idx    = CHAPTER_PAGE_IDX
+    total       = len(chapters)
+    total_pages = max(1, (total + CHAPTERS_PER_PAGE - 1) // CHAPTERS_PER_PAGE)
+    start       = page_idx * CHAPTERS_PER_PAGE
+    page_chapters = chapters[start : start + CHAPTERS_PER_PAGE]
+
+    for i in range(deck.key_count()):
+        slot = i + 1
+        if slot == PLAYPAUSE_SLOT:
+            img = make_playpause_image(deck)
+        elif slot == CHAPTER_BACK_SLOT:  # slot 15
+            img  = _tile(deck, (100, 30, 30), "15", (220, 100, 100))
+            _txt(ImageDraw.Draw(img), "Back", w, h // 2 - 4, (255, 160, 160))
+        elif slot == CHAPTER_NEXT_SLOT and total_pages > 1:  # slot 13
+            img  = _tile(deck, (15, 95, 165), "13", (120, 200, 255))
+            _txt(ImageDraw.Draw(img), "Next", w, h // 2 - 8, (220, 240, 255))
+            _txt(ImageDraw.Draw(img), f"{page_idx + 1}/{total_pages}", w, h // 2 + 4, (200, 230, 255))
+        else:
+            # Chapter slot 1..12 (or 13 if single-page)
+            chapter_slot_idx = slot - 1
+            if chapter_slot_idx < len(page_chapters):
+                ch = page_chapters[chapter_slot_idx]
+                img = make_chapter_tile_image(deck, ch, start + chapter_slot_idx + 1)
+            else:
+                img = Image.new("RGB", (w, h), (15, 15, 15))
+        deck.set_key_image(i, PILHelper.to_native_format(deck, img))
+
 # -- Mode transitions ---------------------------------------------------------
 
 def go_normal(deck):
@@ -393,6 +481,29 @@ def go_device_select(deck):
         ACTIVE_DEVICE_ID = active_id
     log.info("Mode: device select -- %d devices", len(devices))
     render_device_select(deck)
+
+def go_chapters(deck, card_id: str, card_title: str, source_slot: int, source_page_idx: int):
+    """Enter chapter-browse for a card. Fetches chapters synchronously; bails out
+    to normal mode if the card has none or the fetch fails. Remembers the source
+    slot/page so when the user picks a chapter we can resend the original slot
+    and let the server resolve the cardId from the user's own config."""
+    global CURRENT_MODE, CHAPTERS, CHAPTER_PAGE_IDX, CHAPTER_CARD_ID, CHAPTER_CARD_TITLE
+    global CHAPTER_SOURCE_SLOT, CHAPTER_SOURCE_PAGE_IDX
+    chapters = fetch_chapters(card_id)
+    if len(chapters) <= 1:
+        log.info("Card %s has %d chapter(s) — staying in normal mode", card_title, len(chapters))
+        return False
+    with _config_lock:
+        CHAPTERS                = chapters
+        CHAPTER_PAGE_IDX        = 0
+        CHAPTER_CARD_ID         = card_id
+        CHAPTER_CARD_TITLE      = card_title
+        CHAPTER_SOURCE_SLOT     = source_slot
+        CHAPTER_SOURCE_PAGE_IDX = source_page_idx
+    with _state_lock: CURRENT_MODE = MODE_CHAPTERS
+    log.info("Mode: chapters -- %s (%d chapters)", card_title, len(chapters))
+    render_chapters(deck)
+    return True
 
 # -- Sleep state machine ------------------------------------------------------
 
@@ -604,8 +715,9 @@ def handle_gesture(deck, key_index: int, gesture: str):
         mode        = CURRENT_MODE
         device_list = list(DEVICE_LIST)
 
-    # Menu modes only respond to single tap — double/long would feel weird here
-    if mode in (MODE_DEVICE_SELECT, MODE_SETTINGS) and gesture != "single":
+    # Menu modes only respond to single tap — double/long would feel weird here.
+    # Play/pause (slot 14) is the exception: it should keep working in chapter mode.
+    if mode in (MODE_DEVICE_SELECT, MODE_SETTINGS, MODE_CHAPTERS) and gesture != "single":
         return
 
     # Device selection mode
@@ -655,6 +767,58 @@ def handle_gesture(deck, key_index: int, gesture: str):
             go_normal(deck)
         return
 
+    # Chapter browse mode
+    if mode == MODE_CHAPTERS:
+        # Play/pause keeps working
+        if slot == PLAYPAUSE_SLOT:
+            _trigger_playpause(deck, key_index)
+            return
+        # Back to normal grid
+        if slot == CHAPTER_BACK_SLOT:
+            go_normal(deck)
+            return
+        with _config_lock:
+            chapters       = list(CHAPTERS)
+            page_idx       = CHAPTER_PAGE_IDX
+            card_title     = CHAPTER_CARD_TITLE
+            source_slot    = CHAPTER_SOURCE_SLOT
+            source_page_ix = CHAPTER_SOURCE_PAGE_IDX
+        total       = len(chapters)
+        total_pages = max(1, (total + CHAPTERS_PER_PAGE - 1) // CHAPTERS_PER_PAGE)
+        # Next/cycle chapter page
+        if slot == CHAPTER_NEXT_SLOT and total_pages > 1:
+            global CHAPTER_PAGE_IDX
+            with _config_lock:
+                CHAPTER_PAGE_IDX = (CHAPTER_PAGE_IDX + 1) % total_pages
+                new_idx = CHAPTER_PAGE_IDX
+            log.info("Chapters page %d/%d", new_idx + 1, total_pages)
+            render_chapters(deck)
+            return
+        # Chapter pick
+        ch_idx = page_idx * CHAPTERS_PER_PAGE + (slot - 1)
+        if ch_idx >= total:
+            return
+        ch = chapters[ch_idx]
+        chapter_key = ch.get("key")
+        if not chapter_key:
+            return
+        log.info("Chapter pick: %s ch %s (%s)", card_title, chapter_key, ch.get("title", "?"))
+        deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_pressed_image(deck, slot)))
+        ok = False
+        try:
+            r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
+                              json={"slot": source_slot, "pageIdx": source_page_ix, "chapterKey": chapter_key}, timeout=15)
+            ok = r.ok
+            if not r.ok:
+                log.warning("Chapter trigger failed: %s %s", r.status_code, r.text[:120])
+        except Exception as exc:
+            log.error("Chapter trigger error: %s", exc)
+        # Quick feedback then return to normal grid
+        img = make_feedback_image(deck, slot, ok)
+        deck.set_key_image(key_index, PILHelper.to_native_format(deck, img))
+        threading.Timer(1.2, lambda: go_normal(deck)).start()
+        return
+
     # Normal mode — reserved slots only respond to single tap for now
     if slot == SETTINGS_SLOT:
         if gesture == "single":
@@ -681,17 +845,20 @@ def handle_gesture(deck, key_index: int, gesture: str):
         return
 
     with _config_lock:
-        assignment = BUTTON_CONFIG.get(slot)
+        assignment       = BUTTON_CONFIG.get(slot)
+        current_page_idx = PAGE_IDX
 
     if not assignment:
         log.info("Slot %d: nothing assigned", slot)
         return
 
+    # Long press on a card → enter chapter browse
+    if gesture == "long":
+        go_chapters(deck, assignment.get("cardId", ""), assignment.get("title", "?"), slot, current_page_idx)
+        return
+
     log.info("Slot %d %s -> %s", slot, gesture, assignment.get("title", "?"))
     deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_pressed_image(deck, slot)))
-
-    with _config_lock:
-        current_page_idx = PAGE_IDX
 
     feedback = False
     try:
