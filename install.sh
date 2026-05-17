@@ -62,17 +62,23 @@ fi
 
 # -- First-time config
 if [ ! -f "$CONF_FILE" ]; then
-    echo ""
-    echo "  First-time setup"
-    echo "  ─────────────────"
-    echo "  Open https://www.dailyadventure.io/streamdeck in your browser,"
-    echo "  go to the API Key section, and generate a key."
-    echo ""
-    read -rp "  API URL [https://www.dailyadventure.io]: " api_url
-    api_url="${api_url:-https://www.dailyadventure.io}"
-    echo ""
-    read -rp "  API Key (da_...): " api_key
-    echo ""
+    if [ -n "${1:-}" ]; then
+        api_key="$1"
+        api_url="https://www.dailyadventure.io"
+        info "Using API key from install command."
+    else
+        echo ""
+        echo "  First-time setup"
+        echo "  ─────────────────"
+        echo "  Open https://www.dailyadventure.io/streamdeck in your browser,"
+        echo "  go to the API Key section, and generate a key."
+        echo ""
+        read -rp "  API URL [https://www.dailyadventure.io]: " api_url
+        api_url="${api_url:-https://www.dailyadventure.io}"
+        echo ""
+        read -rp "  API Key (da_...): " api_key
+        echo ""
+    fi
 
     printf 'DA_API_URL=%s\nDA_API_KEY=%s\n' "$api_url" "$api_key" \
         | sudo tee "$CONF_FILE" > /dev/null
