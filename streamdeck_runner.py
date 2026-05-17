@@ -503,24 +503,110 @@ def _trigger_playpause(deck, key_index: int):
             deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_playpause_image(deck)))
     threading.Thread(target=_restore, daemon=True).start()
 
+# -- Gesture detection --------------------------------------------------------
+#
+# We get raw press/release events from the Stream Deck library. Map them to
+# three gestures: 'single', 'double', 'long'. Latency profile:
+#   - long: fires the moment the hold crosses LONG_PRESS_MS, no wait for release
+#   - single: fires DOUBLE_TAP_WINDOW_MS after release (we have to wait to know
+#     if a second tap is coming)
+#   - double: fires immediately on second release inside the window
+
+LONG_PRESS_MS        = 600
+DOUBLE_TAP_WINDOW_MS = 300
+
+# Per-key: { press_time, release_time, tap_count, hold_timer, fire_timer, long_fired }
+_gesture_state: dict[int, dict] = {}
+_gesture_lock = threading.Lock()
+
+def _gesture_reset(key_index: int):
+    """Drop any pending timers/state for a key. Used after sleep wake so the
+    press that woke us doesn't get counted toward a gesture."""
+    with _gesture_lock:
+        s = _gesture_state.get(key_index)
+        if not s: return
+        for t_key in ("hold_timer", "fire_timer"):
+            t = s.get(t_key)
+            if t: t.cancel()
+        _gesture_state[key_index] = {}
+
+def _gesture_dispatch(deck, key_index: int, state: bool):
+    now = time.time()
+    with _gesture_lock:
+        s = _gesture_state.setdefault(key_index, {})
+        if state:
+            # PRESS-DOWN
+            # If the previous release was outside the double-tap window, reset count
+            last_release = s.get("release_time", 0) or 0
+            if (now - last_release) * 1000 > DOUBLE_TAP_WINDOW_MS:
+                s["tap_count"] = 0
+            # Cancel any pending single-tap fire (another press came in)
+            ft = s.get("fire_timer")
+            if ft: ft.cancel()
+            s["fire_timer"] = None
+            s["press_time"] = now
+            s["release_time"] = None
+            s["long_fired"] = False
+            s["tap_count"] = s.get("tap_count", 0) + 1
+            # Start long-press watcher
+            def _long_check():
+                with _gesture_lock:
+                    if s.get("long_fired"): return
+                    if s.get("release_time"): return  # already released
+                    s["long_fired"] = True
+                    s["tap_count"] = 0
+                handle_gesture(deck, key_index, "long")
+            ht = threading.Timer(LONG_PRESS_MS / 1000, _long_check)
+            ht.daemon = True
+            s["hold_timer"] = ht
+            ht.start()
+        else:
+            # PRESS-UP
+            s["release_time"] = now
+            ht = s.get("hold_timer")
+            if ht: ht.cancel()
+            if s.get("long_fired"):
+                return  # long already fired; ignore release
+            # Wait DOUBLE_TAP_WINDOW_MS to see if another press follows
+            def _fire():
+                with _gesture_lock:
+                    if s.get("long_fired"): return
+                    count = s.get("tap_count", 0)
+                    s["tap_count"] = 0
+                if count >= 2:
+                    handle_gesture(deck, key_index, "double")
+                else:
+                    handle_gesture(deck, key_index, "single")
+            ft = threading.Timer(DOUBLE_TAP_WINDOW_MS / 1000, _fire)
+            ft.daemon = True
+            s["fire_timer"] = ft
+            ft.start()
+
 # -- Button press handler -----------------------------------------------------
 
 def on_button_press(deck, key_index: int, state: bool):
-    if not state:
-        return
+    # Sleep wake on press-down must fire immediately, not after gesture detection,
+    # so the kid sees the screen come on the instant they touch a key.
+    if state:
+        with _sleep_lock:
+            sleep_state = SLEEP_STATE
+        if sleep_state != SLEEP_AWAKE:
+            wake_up(deck)
+            _gesture_reset(key_index)
+            return
+    _gesture_dispatch(deck, key_index, state)
+
+def handle_gesture(deck, key_index: int, gesture: str):
     slot = key_index + 1
-
-    # Sleep intercept — wake without triggering
-    with _sleep_lock:
-        sleep_state = SLEEP_STATE
-
-    if sleep_state != SLEEP_AWAKE:
-        wake_up(deck)
-        return
+    log.info("Slot %d: %s", slot, gesture)
 
     with _state_lock:
         mode        = CURRENT_MODE
         device_list = list(DEVICE_LIST)
+
+    # Menu modes only respond to single tap — double/long would feel weird here
+    if mode in (MODE_DEVICE_SELECT, MODE_SETTINGS) and gesture != "single":
+        return
 
     # Device selection mode
     if mode == MODE_DEVICE_SELECT:
@@ -569,17 +655,21 @@ def on_button_press(deck, key_index: int, state: bool):
             go_normal(deck)
         return
 
-    # Normal mode
+    # Normal mode — reserved slots only respond to single tap for now
     if slot == SETTINGS_SLOT:
-        go_settings(deck)
+        if gesture == "single":
+            go_settings(deck)
         return
 
     if slot == PLAYPAUSE_SLOT:
-        _trigger_playpause(deck, key_index)
+        if gesture == "single":
+            _trigger_playpause(deck, key_index)
         return
 
     # Page-switcher (multi-page only). Cycles locally, no server call.
     if slot == PAGE_SWITCHER_SLOT and _is_multipage():
+        if gesture != "single":
+            return
         global PAGE_IDX
         with _config_lock:
             PAGE_IDX = (PAGE_IDX + 1) % len(PAGES)
@@ -597,17 +687,7 @@ def on_button_press(deck, key_index: int, state: bool):
         log.info("Slot %d: nothing assigned", slot)
         return
 
-    # Rapid double-tap guard
-    with _pressed_lock:
-        last     = LAST_PRESSED.get(slot, 0)
-        too_soon = (time.time() - last) < PRESS_DEBOUNCE
-        if not too_soon:
-            LAST_PRESSED[slot] = time.time()
-    if too_soon:
-        log.info("Slot %d: debounced", slot)
-        return
-
-    log.info("Slot %d pressed -> %s", slot, assignment.get("title", "?"))
+    log.info("Slot %d %s -> %s", slot, gesture, assignment.get("title", "?"))
     deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_pressed_image(deck, slot)))
 
     with _config_lock:
@@ -616,7 +696,7 @@ def on_button_press(deck, key_index: int, state: bool):
     feedback = False
     try:
         r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
-                          json={"slot": slot, "pageIdx": current_page_idx}, timeout=15)
+                          json={"slot": slot, "pageIdx": current_page_idx, "gesture": gesture}, timeout=15)
         if r.ok:
             data = r.json()
             if data.get("alreadyPlaying"):
