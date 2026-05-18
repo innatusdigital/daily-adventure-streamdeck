@@ -24,7 +24,7 @@ import logging
 import threading
 import requests
 from datetime import datetime
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 try:
     from StreamDeck.DeviceManager import DeviceManager
@@ -118,6 +118,15 @@ _sleep_lock  = threading.Lock()
 
 PLAYPAUSE_ICON: Image.Image | None = None
 
+# Noto Color Emoji is a bitmap font that only renders at one fixed pixel size.
+# We load it at that size and resize the rendered emoji down to fit the tile.
+EMOJI_FONT_PATHS = [
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+]
+EMOJI_FONT_NATIVE_SIZE = 109
+EMOJI_FONT: ImageFont.FreeTypeFont | None = None
+
 # -- Icon loading -------------------------------------------------------------
 
 def load_icons():
@@ -128,6 +137,42 @@ def load_icons():
         log.info("Loaded icon: %s", path)
     else:
         log.warning("Icon not found at %s -- using fallback", path)
+    _load_emoji_font()
+
+def _load_emoji_font():
+    """Best-effort load of a color emoji font. If unavailable, HA tiles still
+    render — they just show the label without an emoji glyph."""
+    global EMOJI_FONT
+    for path in EMOJI_FONT_PATHS:
+        if os.path.exists(path):
+            try:
+                EMOJI_FONT = ImageFont.truetype(path, size=EMOJI_FONT_NATIVE_SIZE)
+                log.info("Loaded color emoji font: %s", path)
+                return
+            except Exception as exc:
+                log.warning("Failed to load emoji font %s: %s", path, exc)
+    log.info("No color emoji font found — HA tiles will render without emoji glyphs")
+
+def render_emoji(emoji: str, target_px: int) -> Image.Image | None:
+    """Renders a Unicode emoji string into a square RGBA image at target_px,
+    using Pillow's color-emoji path. Returns None if no font is loaded or the
+    glyph can't be rendered."""
+    if not EMOJI_FONT or not emoji:
+        return None
+    try:
+        canvas_size = EMOJI_FONT_NATIVE_SIZE + 40
+        img = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # embedded_color=True tells Pillow to honor the bitmap CBDT glyphs
+        draw.text((0, 0), emoji, font=EMOJI_FONT, embedded_color=True)
+        bbox = img.getbbox()
+        if not bbox:
+            return None
+        img = img.crop(bbox)
+        return img.resize((target_px, target_px), Image.LANCZOS)
+    except Exception as exc:
+        log.debug("Emoji render failed for %r: %s", emoji, exc)
+        return None
 
 # -- API helpers --------------------------------------------------------------
 
@@ -269,14 +314,16 @@ def make_ha_tile_image(deck, slot: int, assignment: dict) -> Image.Image:
     badge = Image.new("RGBA", (16, 12), (0, 0, 0, 110))
     img.paste(badge, (2, 2), badge)
     ImageDraw.Draw(img).text((5, 3), str(slot), fill=(255, 255, 255))
-    # Emoji centred top — Pillow's default bitmap font can't render colour emoji
-    # but it will at least draw the codepoint placeholder. If you install a
-    # colour-emoji font on the Pi (e.g. fonts-noto-color-emoji), Pillow ≥9
-    # will pick it up automatically and render it for real.
+    # Colour emoji rendered via Pillow's embedded_color path. If no emoji font
+    # is loaded, render_emoji returns None and the tile shows label only.
     emoji = assignment.get("emoji", "")
     if emoji:
-        ex = max(2, (w - len(emoji) * 8) // 2)
-        draw.text((ex, h // 4 - 4), emoji, fill=(255, 255, 255))
+        emoji_px = max(20, int(min(w, h) * 0.45))
+        emoji_img = render_emoji(emoji, emoji_px)
+        if emoji_img is not None:
+            ex = (w - emoji_px) // 2
+            ey = max(14, h // 2 - emoji_px // 2 - 6)
+            img.paste(emoji_img, (ex, ey), emoji_img)
     # Label centred lower-middle, wrapped to two short lines
     label = assignment.get("label", "")
     if label:
