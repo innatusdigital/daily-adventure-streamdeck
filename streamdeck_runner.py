@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Stream Deck runner for Daily Adventure / Yoto.
+AdventurePad runner — drives a physical Elgato Stream Deck against the
+Daily Adventure API. Authenticates with x-streamdeck-key (header name
+kept stable to avoid orphaning Pis already in the wild).
 
 Modes:
-  NORMAL        -- slots 1-13 play cards, slot 14 = play/pause, slot 15 = settings
+  NORMAL        -- slots 1-13 play cards / fire HA actions, slot 14 = play/pause, slot 15 = settings
   SETTINGS      -- slot 1 = select player, slot 2 = refresh, slot 15 = back
   DEVICE_SELECT -- device tiles, slot 15 = cancel
+  CHAPTERS      -- chapter / track picker opened by long-pressing a card
 
 Sleep states:
   AWAKE  -- full brightness, normal interaction
@@ -134,7 +137,7 @@ def _headers() -> dict:
 def fetch_config() -> dict:
     """Returns { buttons, dimTime, offTime }."""
     try:
-        r = requests.get(f"{API_URL}/api/yoto/streamdeck", headers=_headers(), timeout=10)
+        r = requests.get(f"{API_URL}/api/yoto/adventurepad", headers=_headers(), timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as exc:
@@ -143,7 +146,7 @@ def fetch_config() -> dict:
 
 def fetch_devices() -> tuple[list[dict], str]:
     try:
-        r = requests.get(f"{API_URL}/api/yoto/streamdeck/devices", headers=_headers(), timeout=10)
+        r = requests.get(f"{API_URL}/api/yoto/adventurepad/devices", headers=_headers(), timeout=10)
         r.raise_for_status()
         data = r.json()
         return data.get("devices", []), data.get("activeDeviceId") or ""
@@ -154,7 +157,7 @@ def fetch_devices() -> tuple[list[dict], str]:
 def fetch_chapters(card_id: str) -> list[dict]:
     """Returns [{key, title}, ...] for a card, or [] on error."""
     try:
-        r = requests.get(f"{API_URL}/api/yoto/streamdeck/chapters",
+        r = requests.get(f"{API_URL}/api/yoto/adventurepad/chapters",
                          params={"cardId": card_id}, headers=_headers(), timeout=10)
         r.raise_for_status()
         return r.json().get("chapters", [])
@@ -225,6 +228,81 @@ def _apply_config_payload(data: dict):
         _apply_current_page()
 
 # -- Tile renderers -----------------------------------------------------------
+#
+# HA tile colour gradients. Keys + RGB tuples must mirror src/components/
+# adventurepad/adventurepad.types.ts:TINTS in the web app — if the web side
+# adds a tint, add it here too.
+TINTS = {
+    "amber":   ((253, 186, 116), (194,  65,  12)),
+    "blue":    ((56,  189, 248), (2,   132, 199)),
+    "purple":  ((192, 132, 252), (126, 34,  206)),
+    "emerald": ((52,  211, 153), (4,   120,  87)),
+    "pink":    ((244, 114, 182), (190, 24,   93)),
+    "slate":   ((100, 116, 139), (30,  41,   59)),
+}
+
+def _vertical_gradient(w: int, h: int, c1: tuple, c2: tuple) -> Image.Image:
+    """Top-to-bottom linear gradient between c1 and c2."""
+    img = Image.new("RGB", (w, h), c1)
+    draw = ImageDraw.Draw(img)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        r = int(c1[0] + (c2[0] - c1[0]) * t)
+        g = int(c1[1] + (c2[1] - c1[1]) * t)
+        b = int(c1[2] + (c2[2] - c1[2]) * t)
+        draw.line([(0, y), (w, y)], fill=(r, g, b))
+    return img
+
+def make_ha_tile_image(deck, slot: int, assignment: dict) -> Image.Image:
+    """Home Assistant action tile — coloured gradient with emoji on top and
+    label below. The emoji renders only on systems whose Pillow has a colour-
+    emoji-capable font; otherwise it shows as a glyph box, which is still
+    distinct from a card tile. The label is always readable.
+    """
+    kf = deck.key_image_format()
+    w, h = kf["size"]
+    tint_id = assignment.get("tintId", "amber")
+    c1, c2 = TINTS.get(tint_id, TINTS["amber"])
+    img = _vertical_gradient(w, h, c1, c2)
+    draw = ImageDraw.Draw(img)
+    # Slot number badge (top-left, semi-transparent black behind)
+    badge = Image.new("RGBA", (16, 12), (0, 0, 0, 110))
+    img.paste(badge, (2, 2), badge)
+    ImageDraw.Draw(img).text((5, 3), str(slot), fill=(255, 255, 255))
+    # Emoji centred top — Pillow's default bitmap font can't render colour emoji
+    # but it will at least draw the codepoint placeholder. If you install a
+    # colour-emoji font on the Pi (e.g. fonts-noto-color-emoji), Pillow ≥9
+    # will pick it up automatically and render it for real.
+    emoji = assignment.get("emoji", "")
+    if emoji:
+        ex = max(2, (w - len(emoji) * 8) // 2)
+        draw.text((ex, h // 4 - 4), emoji, fill=(255, 255, 255))
+    # Label centred lower-middle, wrapped to two short lines
+    label = assignment.get("label", "")
+    if label:
+        words = label.split()
+        l1 = ""
+        l2 = ""
+        for word in words:
+            cand = (l1 + " " + word).strip() if l1 else word
+            if len(cand) <= 9:
+                l1 = cand
+            else:
+                cand2 = (l2 + " " + word).strip() if l2 else word
+                l2 = cand2[:9]
+        y = h - 22 if l2 else h - 14
+        _txt(draw, l1, w, y, (255, 255, 255))
+        if l2:
+            _txt(draw, l2, w, y + 10, (255, 255, 255))
+    return img
+
+def make_assignment_image(deck, slot: int, assignment: dict | None) -> Image.Image:
+    """Dispatch to the right tile renderer based on assignment kind. Pre-v7
+    records have no `kind` field — default to 'card' so existing layouts keep
+    working."""
+    if assignment and assignment.get("kind") == "ha":
+        return make_ha_tile_image(deck, slot, assignment)
+    return make_card_image(deck, slot, assignment)
 
 def make_card_image(deck, slot: int, assignment: dict | None) -> Image.Image:
     kf = deck.key_image_format()
@@ -245,20 +323,20 @@ def make_card_image(deck, slot: int, assignment: dict | None) -> Image.Image:
 def make_pressed_image(deck, slot: int) -> Image.Image:
     with _config_lock:
         a = BUTTON_CONFIG.get(slot)
-    base = make_card_image(deck, slot, a)
+    base = make_assignment_image(deck, slot, a)
     return Image.alpha_composite(base.convert("RGBA"), Image.new("RGBA", base.size, (0, 0, 0, 110))).convert("RGB")
 
 def make_feedback_image(deck, slot: int, success: bool) -> Image.Image:
     with _config_lock:
         a = BUTTON_CONFIG.get(slot)
-    base  = make_card_image(deck, slot, a)
+    base  = make_assignment_image(deck, slot, a)
     color = (0, 190, 70, 150) if success else (210, 30, 30, 150)
     return Image.alpha_composite(base.convert("RGBA"), Image.new("RGBA", base.size, color)).convert("RGB")
 
 def make_already_playing_image(deck, slot: int) -> Image.Image:
     with _config_lock:
         a = BUTTON_CONFIG.get(slot)
-    base = make_card_image(deck, slot, a)
+    base = make_assignment_image(deck, slot, a)
     return Image.alpha_composite(base.convert("RGBA"), Image.new("RGBA", base.size, (220, 180, 0, 150))).convert("RGB")
 
 def make_playpause_image(deck) -> Image.Image:
@@ -380,7 +458,7 @@ def render_normal(deck):
         else:
             with _config_lock:
                 a = BUTTON_CONFIG.get(slot)
-            img = make_card_image(deck, slot, a)
+            img = make_assignment_image(deck, slot, a)
         deck.set_key_image(i, PILHelper.to_native_format(deck, img))
 
 def render_settings(deck):
@@ -593,7 +671,7 @@ def _trigger_playpause(deck, key_index: int):
 
     success = False
     try:
-        r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
+        r = requests.post(f"{API_URL}/api/yoto/adventurepad/trigger", headers=_headers(),
                           json={"slot": PLAYPAUSE_SLOT}, timeout=15)
         success = r.ok
         if r.ok:
@@ -737,7 +815,7 @@ def handle_gesture(deck, key_index: int, gesture: str):
         device_name = chosen.get("deviceName", "?")
         log.info("Device selected: %s", device_name)
         try:
-            r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
+            r = requests.post(f"{API_URL}/api/yoto/adventurepad/trigger", headers=_headers(),
                               json={"slot": SETTINGS_SLOT, "deviceId": device_id}, timeout=15)
             if r.ok:
                 with _state_lock:
@@ -808,7 +886,7 @@ def handle_gesture(deck, key_index: int, gesture: str):
         deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_pressed_image(deck, slot)))
         ok = False
         try:
-            r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
+            r = requests.post(f"{API_URL}/api/yoto/adventurepad/trigger", headers=_headers(),
                               json={"slot": source_slot, "pageIdx": source_page_ix, "chapterKey": chapter_key}, timeout=15)
             ok = r.ok
             if not r.ok:
@@ -853,17 +931,18 @@ def handle_gesture(deck, key_index: int, gesture: str):
         log.info("Slot %d: nothing assigned", slot)
         return
 
-    # Long press on a card → enter chapter browse
-    if gesture == "long":
+    # Long press on a Yoto card → enter chapter browse. HA actions have no
+    # chapters, so fall through and fire the action normally.
+    if gesture == "long" and assignment.get("kind", "card") == "card":
         go_chapters(deck, assignment.get("cardId", ""), assignment.get("title", "?"), slot, current_page_idx)
         return
 
-    log.info("Slot %d %s -> %s", slot, gesture, assignment.get("title", "?"))
+    log.info("Slot %d %s -> %s", slot, gesture, assignment.get("title") or assignment.get("label") or "?")
     deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_pressed_image(deck, slot)))
 
     feedback = False
     try:
-        r = requests.post(f"{API_URL}/api/yoto/streamdeck/trigger", headers=_headers(),
+        r = requests.post(f"{API_URL}/api/yoto/adventurepad/trigger", headers=_headers(),
                           json={"slot": slot, "pageIdx": current_page_idx, "gesture": gesture}, timeout=15)
         if r.ok:
             data = r.json()
@@ -889,7 +968,7 @@ def handle_gesture(deck, key_index: int, gesture: str):
         with _state_lock: m = CURRENT_MODE
         if m == MODE_NORMAL:
             with _config_lock: a = BUTTON_CONFIG.get(slot)
-            deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_card_image(deck, slot, a)))
+            deck.set_key_image(key_index, PILHelper.to_native_format(deck, make_assignment_image(deck, slot, a)))
     threading.Thread(target=_restore, daemon=True).start()
 
 # -- Config polling -----------------------------------------------------------
