@@ -25,7 +25,8 @@ echo ""
 # -- System dependencies
 info "Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y git python3-venv libhidapi-libusb0 librsvg2-bin 2>&1 | grep -E "^(Get|Setting|Unpacking|E:)" || true
+sudo apt-get install -y git python3-venv libhidapi-libusb0 librsvg2-bin \
+    fonts-noto-color-emoji 2>&1 | grep -E "^(Get|Setting|Unpacking|E:)" || true
 
 # -- Clone or update
 if [ -d "$INSTALL_DIR/.git" ]; then
